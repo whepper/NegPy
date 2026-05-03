@@ -58,6 +58,7 @@ class GPUEngine:
             "retouch": get_resource_path(os.path.join("negpy", "features", "retouch", "shaders", "retouch.wgsl")),
             "lab": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "lab.wgsl")),
             "toning": get_resource_path(os.path.join("negpy", "features", "toning", "shaders", "toning.wgsl")),
+            "finish": get_resource_path(os.path.join("negpy", "features", "finish", "shaders", "finish.wgsl")),
             "metrics": get_resource_path(os.path.join("negpy", "features", "lab", "shaders", "metrics.wgsl")),
             "layout": get_resource_path(os.path.join("negpy", "features", "toning", "shaders", "layout.wgsl")),
         }
@@ -74,6 +75,7 @@ class GPUEngine:
             "retouch_u",
             "lab",
             "toning",
+            "finish",
             "layout",
         ]
         self._alignment = UNIFORM_ALIGNMENT_DEFAULT
@@ -118,17 +120,23 @@ class GPUEngine:
             return 4
         if last.toning != settings.toning:
             return 5
-        if last.export != settings.export:
+        if last.finish != settings.finish:
             return 6
+        if last.export != settings.export:
+            return 7
 
-        return 7  # Nothing changed
+        return 8  # Nothing changed
 
     def _get_intermediate_texture(self, w: int, h: int, usage: int, label: str) -> GPUTexture:
         """Retrieves or creates a texture from the pool.
 
-        Key is (w, h, usage, label). A 90°/270° rotation already swaps w and h, so
-        the key naturally changes with geometry — no extra geometry field needed.
+        Key is (w, h, usage, label). A 90°/270° rotation already swaps w and h
+        upstream (see w_rot/h_rot computation), so the key naturally changes
+        with geometry — no extra geometry field needed.
         Contents are fully overwritten each render, so no stale-data risk.
+
+        Invariant: callers must pass post-rotation dimensions. If rotation
+        handling ever moves downstream of texture allocation, revisit this key.
         """
         key = (w, h, usage, label)
         if key not in self._tex_cache:
@@ -188,6 +196,7 @@ class GPUEngine:
             "retouch_u": 40,
             "lab": 96,
             "toning": 64,
+            "finish": 32,
             "layout": 48,
         }
         return {
@@ -248,6 +257,11 @@ class GPUEngine:
         else:
             rot = settings.geometry.rotation % 4
             w_rot, h_rot = (h, w) if rot in (1, 3) else (w, h)
+            # Invariant: intermediate textures are allocated with post-rotation
+            # dimensions, so the cache key naturally avoids 90°/270° collisions.
+            # If rotation handling ever moves downstream of _get_intermediate_texture
+            # calls, this invariant must be re-checked.
+            assert w_rot > 0 and h_rot > 0
             actual_full_dims, orig_shape = (w_rot, h_rot), (h, w)
             if settings.geometry.manual_crop_rect:
                 roi = get_manual_rect_coords(
@@ -510,6 +524,29 @@ class GPUEngine:
                 crop_h,
             )
 
+        # --- Finish (Vignette) ---
+        tex_finish = self._get_intermediate_texture(
+            crop_w,
+            crop_h,
+            wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_SRC,
+            "finish_tex",
+        )
+        if start_stage <= 6:
+            self._dispatch_pass(
+                enc,
+                "finish",
+                [
+                    (0, tex_toning.view),
+                    (1, tex_finish.view),
+                    (2, self._get_uniform_binding("finish")),
+                ],
+                crop_w,
+                crop_h,
+            )
+            tex_for_layout = tex_finish
+        else:
+            tex_for_layout = tex_toning
+
         if not tiling_mode and apply_layout:
             paper_w, paper_h, content_w, content_h, off_x, off_y = self._calculate_layout_dims(settings, crop_w, crop_h, render_size_ref)
             tex_final = self._get_intermediate_texture(
@@ -518,12 +555,12 @@ class GPUEngine:
                 wgpu.TextureUsage.STORAGE_BINDING | wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_SRC,
                 "final",
             )
-            if start_stage <= 6:
+            if start_stage <= 7:
                 self._dispatch_pass(
                     enc,
                     "layout",
                     [
-                        (0, tex_toning.view),
+                        (0, tex_for_layout.view),
                         (1, tex_final.view),
                         (2, self._get_uniform_binding("layout")),
                     ],
@@ -532,7 +569,7 @@ class GPUEngine:
                 )
             content_rect = (off_x, off_y, content_w, content_h)
         else:
-            tex_final, content_rect = tex_toning, (0, 0, crop_w, crop_h)
+            tex_final, content_rect = tex_for_layout, (0, 0, crop_w, crop_h)
 
         if not tiling_mode and readback_metrics:
             device.queue.write_buffer(self._buffers["metrics"].buffer, 0, np.zeros(1024, dtype=np.uint32))
@@ -761,8 +798,10 @@ class GPUEngine:
             )
         )
 
+        f_data = struct.pack("ff", float(settings.finish.vignette_strength), float(settings.finish.vignette_size)) + b"\x00" * 24
+
         pw, ph, cw, ch, ox, oy = self._calculate_layout_dims(settings, crop_w, crop_h, render_size_ref)
-        color_hex = settings.export.export_border_color.lstrip("#")
+        color_hex = settings.finish.border_color.lstrip("#")
         bg = tuple(int(color_hex[i : i + 2], 16) / 255.0 for i in (0, 2, 4))
         scale = float(cw) / max(1.0, float(crop_w))
         y_data = (
@@ -773,7 +812,7 @@ class GPUEngine:
         )
 
         full_buffer = bytearray()
-        for d in [g_data, n_data, e_data, c_data, r_u_data, l_data, t_data, y_data]:
+        for d in [g_data, n_data, e_data, c_data, r_u_data, l_data, t_data, f_data, y_data]:
             full_buffer += d + b"\x00" * (self._alignment - len(d))
 
         if not self.gpu.device:
@@ -814,7 +853,7 @@ class GPUEngine:
         dpi = settings.export.export_dpi
         if size_ref:
             dpi = int((size_ref * 2.54) / max(0.1, settings.export.export_print_size))
-        border_px = int((settings.export.export_border_size / 2.54) * dpi)
+        border_px = int((settings.finish.border_size / 2.54) * dpi)
 
         use_orig = settings.export.use_original_res
 
@@ -1120,7 +1159,7 @@ class GPUEngine:
             else full_source_res
         )
         result = np.zeros((paper_h, paper_w, 3), dtype=np.float32)
-        color_hex = settings.export.export_border_color.lstrip("#")
+        color_hex = settings.finish.border_color.lstrip("#")
         result[:] = tuple(int(color_hex[i : i + 2], 16) / 255.0 for i in (0, 2, 4))
         result[off_y : off_y + content_h, off_x : off_x + content_w] = scaled_content
         return result, metrics_ref

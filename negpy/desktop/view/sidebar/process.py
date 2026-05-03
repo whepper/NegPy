@@ -1,4 +1,5 @@
 import math
+
 import qtawesome as qta
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -8,6 +9,7 @@ from PyQt6.QtWidgets import (
 )
 
 from negpy.desktop.view.sidebar.base import BaseSidebar
+from negpy.desktop.view.styles.templates import section_subheader
 from negpy.desktop.view.styles.theme import THEME
 from negpy.desktop.view.widgets.sliders import CompactSlider
 from negpy.features.process.models import ProcessMode
@@ -28,7 +30,7 @@ class ProcessSidebar(BaseSidebar):
         self.layout.addWidget(self.mode_combo)
 
         buf_clip_row = QHBoxLayout()
-        self.analysis_buffer_slider = CompactSlider("Analysis Buffer", 0.0, 0.25, conf.analysis_buffer)
+        self.analysis_buffer_slider = CompactSlider("Analysis Buffer", 0.0, 0.50, conf.analysis_buffer)
         self.analysis_buffer_slider.setToolTip(
             "Crops the analysis region inward to exclude film borders and rebate from exposure calculations"
         )
@@ -48,27 +50,30 @@ class ProcessSidebar(BaseSidebar):
         wp_bp_row.addWidget(self.black_point_slider)
         self.layout.addLayout(wp_bp_row)
 
+        self.layout.addWidget(section_subheader("AUTO"))
+
         self.normalize_e6_btn = QPushButton(" Normalize")
-        self.normalize_e6_btn.setFixedHeight(35)
         self.normalize_e6_btn.setCheckable(True)
         self.normalize_e6_btn.setIcon(qta.icon("fa5s.magic", color=THEME.text_primary))
         self.normalize_e6_btn.setChecked(conf.e6_normalize)
         self.normalize_e6_btn.setToolTip("Automatically stretch the histogram to full dynamic range")
         self.layout.addWidget(self.normalize_e6_btn)
 
+        self.layout.addWidget(section_subheader("BATCH"))
+
         btns_row = QHBoxLayout()
         self.analyze_roll_btn = QPushButton(" Batch Analysis")
-        self.analyze_roll_btn.setFixedHeight(35)
         self.analyze_roll_btn.setIcon(qta.icon("fa5s.search", color=THEME.text_primary))
 
         self.use_roll_avg_btn = QPushButton(" Use Roll Average")
-        self.use_roll_avg_btn.setFixedHeight(35)
         self.use_roll_avg_btn.setCheckable(True)
         self.use_roll_avg_btn.setIcon(qta.icon("mdi6.film", color=THEME.text_primary))
 
         btns_row.addWidget(self.analyze_roll_btn)
         btns_row.addWidget(self.use_roll_avg_btn)
         self.layout.addLayout(btns_row)
+
+        self.layout.addWidget(section_subheader("ROLL"))
 
         self.roll_combo = QComboBox()
         self.roll_combo.setPlaceholderText("Select Roll...")

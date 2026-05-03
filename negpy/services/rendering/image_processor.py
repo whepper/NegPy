@@ -148,12 +148,12 @@ class ImageProcessor:
 
             with ctx_mgr as raw:
                 algo = get_best_demosaic_algorithm(raw)
-                use_camera_wb = params.exposure.use_camera_wb
-                user_wb = None if use_camera_wb else [1, 1, 1, 1]
+                linear_raw = params.exposure.linear_raw
+                user_wb = [1, 1, 1, 1] if linear_raw else None
                 rgb = raw.postprocess(
                     gamma=(1, 1),
                     no_auto_bright=True,
-                    use_camera_wb=use_camera_wb,
+                    use_camera_wb=not linear_raw,
                     user_wb=user_wb,
                     output_bps=16,
                     output_color=rawpy.ColorSpace.raw,
@@ -193,7 +193,7 @@ class ImageProcessor:
 
                 if export_settings.apply_icc:
                     if is_greyscale:
-                        pil_img, icc_bytes = self._apply_color_management(
+                        pil_img, icc_bytes = self.apply_color_management(
                             Image.fromarray(img_int),
                             color_space,
                             export_settings.icc_profile_path,
@@ -229,7 +229,7 @@ class ImageProcessor:
                 icc_path_to_use = export_settings.icc_profile_path if export_settings.apply_icc else None
                 icc_invert_to_use = export_settings.icc_invert if export_settings.apply_icc else False
 
-                pil_img, icc_bytes = self._apply_color_management(
+                pil_img, icc_bytes = self.apply_color_management(
                     Image.fromarray(img_int),
                     color_space,
                     icc_path_to_use,
@@ -245,7 +245,9 @@ class ImageProcessor:
 
     def _apply_scaling_and_border_f32(self, img: np.ndarray, params: WorkspaceConfig, export_settings: ExportConfig) -> np.ndarray:
         """CPU fallback for layout application."""
-        result, _ = PrintService.apply_layout(img, export_settings)
+        result, _ = PrintService.apply_layout(
+            img, export_settings, border_size=params.finish.border_size, border_color=params.finish.border_color
+        )
         return result
 
     def _get_target_icc_bytes(self, color_space: str, icc_path: Optional[str], inverse: bool = False) -> Optional[bytes]:
@@ -294,7 +296,7 @@ class ImageProcessor:
             logger.error(f"CMS transformation failed: {e}")
             return img_u16, None
 
-    def _apply_color_management(
+    def apply_color_management(
         self,
         pil_img: Image.Image,
         color_space: str,

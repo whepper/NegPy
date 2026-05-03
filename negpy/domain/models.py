@@ -9,7 +9,18 @@ from negpy.features.geometry.models import GeometryConfig
 from negpy.features.lab.models import LabConfig
 from negpy.features.retouch.models import RetouchConfig
 from negpy.features.toning.models import ToningConfig
+from negpy.features.finish.models import FinishConfig
+from negpy.kernel.system.logging import get_logger
 import negpy.kernel.system.paths as paths
+
+logger = get_logger("domain.models")
+
+# Map of old field names → new field names for backward-compatible deserialization.
+# Add entries here when fields are renamed so old workspace files keep their data.
+MIGRATIONS: Dict[str, str] = {
+    "export_border_size": "border_size",
+    "export_border_color": "border_color",
+}
 
 
 class AspectRatio(StrEnum):
@@ -65,9 +76,6 @@ class ExportConfig:
     paper_aspect_ratio: str = AspectRatio.ORIGINAL
     export_print_size: float = 30.0
     export_dpi: int = 300
-    export_add_border: bool = False
-    export_border_size: float = 0.0
-    export_border_color: str = "#ffffff"
     use_original_res: bool = False
     filename_pattern: str = "positive_{{ original_name }}"
     apply_icc: bool = False
@@ -87,6 +95,7 @@ class WorkspaceConfig:
     lab: LabConfig = field(default_factory=LabConfig)
     retouch: RetouchConfig = field(default_factory=RetouchConfig)
     toning: ToningConfig = field(default_factory=ToningConfig)
+    finish: FinishConfig = field(default_factory=FinishConfig)
     export: ExportConfig = field(default_factory=ExportConfig)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -100,6 +109,7 @@ class WorkspaceConfig:
         res.update(asdict(self.lab))
         res.update(asdict(self.retouch))
         res.update(asdict(self.toning))
+        res.update(asdict(self.finish))
         res.update(asdict(self.export))
         return res
 
@@ -109,9 +119,32 @@ class WorkspaceConfig:
         from DB/JSON.
         """
 
+        # Apply field renames for backward compatibility.
+        for old_key, new_key in MIGRATIONS.items():
+            if old_key in data:
+                data[new_key] = data.pop(old_key)
+
+        config_classes = [
+            ProcessConfig,
+            ExposureConfig,
+            GeometryConfig,
+            LabConfig,
+            RetouchConfig,
+            ToningConfig,
+            FinishConfig,
+            ExportConfig,
+        ]
+        valid_keys = set()
+        for cc in config_classes:
+            valid_keys.update(cc.__dataclass_fields__.keys())
+
+        unknown = set(data) - valid_keys
+        if unknown:
+            logger.warning("Dropping unknown config keys: %s", sorted(unknown))
+
         def filter_keys(config_cls: Any, d: Dict[str, Any]) -> Dict[str, Any]:
-            valid_keys = config_cls.__dataclass_fields__.keys()
-            return {k: v for k, v in d.items() if k in valid_keys and v is not None}
+            valid = config_cls.__dataclass_fields__.keys()
+            return {k: v for k, v in d.items() if k in valid and v is not None}
 
         return cls(
             process=ProcessConfig(**filter_keys(ProcessConfig, data)),
@@ -120,5 +153,6 @@ class WorkspaceConfig:
             lab=LabConfig(**filter_keys(LabConfig, data)),
             retouch=RetouchConfig(**filter_keys(RetouchConfig, data)),
             toning=ToningConfig(**filter_keys(ToningConfig, data)),
+            finish=FinishConfig(**filter_keys(FinishConfig, data)),
             export=ExportConfig(**filter_keys(ExportConfig, data)),
         )

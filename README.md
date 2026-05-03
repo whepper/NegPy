@@ -8,7 +8,7 @@ It is built with **Python**, running natively on Linux, macOS, and Windows.
 
 ---
 
-![alt text](docs/media/0150.png)
+![alt text](docs/media/0170.png)
 
 ---
 
@@ -61,9 +61,6 @@ Since this is a free hobby project, I don't pay Apple or Microsoft ransom for th
 **🪟 Windows**:
 1. Run the installer (ignore the warnings)
 2. Start the app and click through the warnings.
-
-##### WARNING:
-Rendering on Windows is a bit broken currently, blame Microslop. [issue #62](https://github.com/marcinz606/NegPy/issues/62)
 
 ---
 

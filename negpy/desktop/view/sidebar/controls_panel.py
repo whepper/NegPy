@@ -25,6 +25,7 @@ from negpy.desktop.view.sidebar.lab import LabSidebar
 from negpy.desktop.view.sidebar.toning import ToningSidebar
 from negpy.desktop.view.sidebar.retouch import RetouchSidebar
 from negpy.desktop.view.sidebar.icc import ICCSidebar
+from negpy.desktop.view.sidebar.finish import FinishSidebar
 
 
 class ControlsPanel(QWidget):
@@ -105,6 +106,14 @@ class ControlsPanel(QWidget):
             icon=qta.icon("fa5s.brush", color=icon_color),
         )
 
+        self.finish_sidebar = FinishSidebar(self.controller)
+        self.finish_section = self._add_sidebar_section(
+            "Finishing",
+            "finish",
+            self.finish_sidebar,
+            icon=qta.icon("fa5s.paint-brush", color=icon_color),
+        )
+
         self.icc_sidebar = ICCSidebar(self.controller)
         self._add_sidebar_section(
             "ICC",
@@ -152,6 +161,7 @@ class ControlsPanel(QWidget):
         self.geometry_section.reset_requested.connect(lambda: self.controller.session.reset_section("geometry"))
         self.process_section.reset_requested.connect(lambda: self.controller.session.reset_section("process"))
         self.retouch_section.reset_requested.connect(lambda: self.controller.session.reset_section("retouch"))
+        self.finish_section.reset_requested.connect(lambda: self.controller.session.reset_section("finish"))
 
     def apply_shortcut_tooltips(self) -> None:
         exp = self.exposure_sidebar
@@ -208,6 +218,17 @@ class ControlsPanel(QWidget):
             tooltip_with_shortcut("Highlight split-tone strength", ["highlight_strength_inc", "highlight_strength_dec"])
         )
 
+        fin = self.finish_sidebar
+        fin.vignette_strength_slider.setToolTip(
+            tooltip_with_shortcut(
+                "Vignette strength: negative = darken edges, positive = brighten edges", ["vignette_str_inc", "vignette_str_dec"]
+            )
+        )
+        fin.vignette_size_slider.setToolTip(
+            tooltip_with_shortcut("Vignette size: how far the vignette extends from center", ["vignette_size_inc", "vignette_size_dec"])
+        )
+        fin.border_slider.setToolTip(tooltip_with_shortcut("Border width", ["border_size_inc", "border_size_dec"]))
+
     def _sync_all_sidebars(self) -> None:
         """Force all sidebar panels to update their widgets from current AppState."""
         self.process_sidebar.sync_ui()
@@ -217,6 +238,7 @@ class ControlsPanel(QWidget):
         self.toning_sidebar.sync_ui()
         self.retouch_sidebar.sync_ui()
         self.icc_sidebar.sync_ui()
+        self.finish_sidebar.sync_ui()
         self.presets_sidebar.sync_ui()
         self._sync_modified_dots()
         buf = self.controller.state.last_metrics.get("histogram_raw")
@@ -236,7 +258,7 @@ class ControlsPanel(QWidget):
             [
                 exp.density != _exp.density,
                 exp.grade != _exp.grade,
-                exp.use_camera_wb != _exp.use_camera_wb,
+                exp.linear_raw != _exp.linear_raw,
                 exp.wb_cyan != _exp.wb_cyan,
                 exp.wb_magenta != _exp.wb_magenta,
                 exp.wb_yellow != _exp.wb_yellow,
@@ -306,12 +328,26 @@ class ControlsPanel(QWidget):
         ret = cfg.retouch
         retouch_count = int(ret.dust_remove) + len(ret.manual_dust_spots)
 
+        from negpy.features.finish.models import FinishConfig
+
+        _fin = FinishConfig()
+        fin = cfg.finish
+        finish_count = sum(
+            [
+                fin.vignette_strength != _fin.vignette_strength,
+                fin.vignette_size != _fin.vignette_size,
+                fin.border_size != _fin.border_size,
+                fin.border_color != _fin.border_color,
+            ]
+        )
+
         self.exposure_section.set_modified(exposure_count)
         self.lab_section.set_modified(lab_count)
         self.toning_section.set_modified(toning_count)
         self.geometry_section.set_modified(geometry_count)
         self.process_section.set_modified(process_count)
         self.retouch_section.set_modified(retouch_count)
+        self.finish_section.set_modified(finish_count)
 
     def _sync_tool_buttons(self) -> None:
         """Updates toggle button states to match active_tool."""
