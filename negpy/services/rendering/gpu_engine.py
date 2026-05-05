@@ -39,6 +39,14 @@ HISTOGRAM_BINS = 256
 METRICS_BUFFER_SIZE = 4096
 
 
+def _downsample_for_analysis(img: np.ndarray, max_size: int) -> np.ndarray:
+    h, w = img.shape[:2]
+    scale = min(1.0, max_size / max(h, w))
+    if scale >= 1.0:
+        return img
+    return cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
+
 class GPUEngine:
     """
     Core GPU orchestration engine using WebGPU.
@@ -331,6 +339,8 @@ class GPUEngine:
                 analysis_roi = None
             if settings.geometry.fine_rotation != 0.0:
                 analysis_source = apply_fine_rotation(analysis_source, settings.geometry.fine_rotation)
+
+            analysis_source = _downsample_for_analysis(analysis_source, APP_CONFIG.preview_render_size)
 
             bounds = analyze_log_exposure_bounds(
                 analysis_source,
@@ -1121,9 +1131,12 @@ class GPUEngine:
                 ceils=settings.process.local_ceils,
             )
         else:
+            ah, aw = img_rot.shape[:2]
+            a_scale = min(1.0, APP_CONFIG.preview_render_size / max(ah, aw))
+            analysis_roi = (int(y1 * a_scale), int(y2 * a_scale), int(x1 * a_scale), int(x2 * a_scale))
             global_bounds = analyze_log_exposure_bounds(
-                img_rot,
-                roi=(y1, y2, x1, x2),
+                _downsample_for_analysis(img_rot, APP_CONFIG.preview_render_size),
+                roi=analysis_roi,
                 analysis_buffer=settings.process.analysis_buffer,
                 process_mode=settings.process.process_mode,
                 e6_normalize=settings.process.e6_normalize,
