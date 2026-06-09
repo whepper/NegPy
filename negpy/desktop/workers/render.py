@@ -1,3 +1,4 @@
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -60,8 +61,11 @@ class PreviewLoadTask:
 
     file_path: str
     workspace_color_space: str
-    linear_raw: bool
+    use_camera_wb: bool
     full_resolution: bool = False
+    file_hash: str | None = None
+    use_splash: bool = True
+    for_cache_warm: bool = False
     detect_mode: bool = False  # run process-mode autodetect (new files only)
 
 
@@ -237,12 +241,13 @@ class AssetDiscoveryWorker(QObject):
 
 class PreviewLoadWorker(QObject):
     """
-    Background worker for decoding RAW files into linear preview buffers.
+    Background worker for decoding RAW files into a linear preview buffer.
     Keeps the UI thread free during slow I/O and demosaicing.
     """
 
     # (file_path, raw, dims, source_cs, ir_preview, detected_mode)
     finished = pyqtSignal(str, object, object, str, object, str)
+    splash = pyqtSignal(str, object, object)  # (file_path, buffer, dims) — first paint
     error = pyqtSignal(str)
 
     def __init__(self, preview_service) -> None:
@@ -251,16 +256,44 @@ class PreviewLoadWorker(QObject):
 
     @pyqtSlot(PreviewLoadTask)
     def process(self, task: PreviewLoadTask) -> None:
+        if task.for_cache_warm:
+            try:
+                self._preview_service.load_linear_preview(
+                    task.file_path,
+                    task.workspace_color_space,
+                    use_camera_wb=task.use_camera_wb,
+                    full_resolution=task.full_resolution,
+                    file_hash=task.file_hash,
+                )
+            except Exception as e:
+                logger.debug("Preview cache warm failed for %s: %s", task.file_path, e)
+            return
+        t0 = time.perf_counter()
         try:
-            raw, dims, metadata = self._preview_service.load_linear_preview(
-                task.file_path,
-                task.workspace_color_space,
-                linear_raw=task.linear_raw,
-                full_resolution=task.full_resolution,
-            )
+            if task.use_splash and not task.full_resolution:
+                # Open the file once; get splash + linear in a single pass.
+                sp, (raw, dims, metadata) = self._preview_service.load_splash_and_linear(
+                    task.file_path,
+                    task.workspace_color_space,
+                    use_camera_wb=task.use_camera_wb,
+                    full_resolution=task.full_resolution,
+                    file_hash=task.file_hash,
+                )
+                if sp is not None:
+                    sbuf, sdims = sp
+                    self.splash.emit(task.file_path, sbuf, sdims)
+            else:
+                raw, dims, metadata = self._preview_service.load_linear_preview(
+                    task.file_path,
+                    task.workspace_color_space,
+                    use_camera_wb=task.use_camera_wb,
+                    full_resolution=task.full_resolution,
+                    file_hash=task.file_hash,
+                )
             source_cs = metadata.get("color_space", "")
             ir_preview = metadata.get("ir_preview")
             detected_mode = self._detect_mode(task, raw) if task.detect_mode else ""
+            logger.debug("PreviewLoadWorker load %.3fs for %s", time.perf_counter() - t0, task.file_path)
             self.finished.emit(task.file_path, raw, dims, source_cs, ir_preview, detected_mode)
         except Exception as e:
             logger.exception(f"Asset load failed: {task.file_path}")
@@ -271,13 +304,13 @@ class PreviewLoadWorker(QObject):
         from negpy.features.process.logic import detect_process_mode
 
         try:
-            if task.linear_raw:
+            if not task.use_camera_wb:
                 scan = raw
             else:
                 scan, _, _ = self._preview_service.load_linear_preview(
                     task.file_path,
                     task.workspace_color_space,
-                    linear_raw=True,
+                    use_camera_wb=False,
                 )
             return str(detect_process_mode(scan))
         except Exception:
@@ -324,7 +357,6 @@ class NormalizationWorker(QObject):
             async with semaphore:
                 try:
                     params = self._repo.load_file_settings(f_info["hash"])
-                    linear_raw = params.exposure.linear_raw if params else False
                     analysis_buffer = params.process.analysis_buffer if params else DEFAULT_WORKSPACE_CONFIG.process.analysis_buffer
                     drange_clip = params.process.drange_clip if params else DEFAULT_WORKSPACE_CONFIG.process.drange_clip
                     process_mode = params.process.process_mode if params else DEFAULT_WORKSPACE_CONFIG.process.process_mode
@@ -332,11 +364,16 @@ class NormalizationWorker(QObject):
                     geometry = params.geometry if params else DEFAULT_WORKSPACE_CONFIG.geometry
 
                     # Use to_thread for blocking CPU/IO bound load and analysis
+                    # Always use flat WB (use_camera_wb=False) for normalization:
+                    # density analysis needs neutral channel values regardless of
+                    # the per-file exposure.linear_raw preference.
                     raw, _, _ = await asyncio.to_thread(
                         self._preview_service.load_linear_preview,
                         f_info["path"],
                         task.workspace_color_space,
-                        linear_raw=linear_raw,
+                        False,  # use_camera_wb
+                        False,  # full_resolution
+                        f_info.get("hash"),
                     )
 
                     ctx = PipelineContext(
