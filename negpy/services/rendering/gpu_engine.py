@@ -11,6 +11,10 @@ from negpy.domain.models import AspectRatio, ExportResolutionMode, WorkspaceConf
 from negpy.features.exposure.normalization import (
     LogNegativeBounds,
     analyze_log_exposure_bounds,
+    luminance_density_range,
+    measure_anchor,
+    measure_shadow_log_refs,
+    measure_textural_range,
 )
 from negpy.features.geometry.logic import (
     AUTOCROP_DETECT_RES,
@@ -267,6 +271,9 @@ class GPUEngine:
         global_offset: Tuple[int, int] = (0, 0),
         full_dims: Optional[Tuple[int, int]] = None,
         clahe_cdf_override: Optional[np.ndarray] = None,
+        shadow_refs_override: Optional[Tuple[float, float, float]] = None,
+        metered_anchor_override: Optional[float] = None,
+        textural_range_override: Optional[float] = None,
         apply_layout: bool = True,
         render_size_ref: Optional[float] = None,
         source_hash: Optional[str] = None,
@@ -340,19 +347,26 @@ class GPUEngine:
             y1, y2, x1, x2 = roi
             crop_w, crop_h = max(1, x2 - x1), max(1, y2 - y1)
 
-        if bounds_override:
-            bounds = bounds_override
-        elif settings.process.use_roll_average and settings.process.is_locked_initialized:
-            bounds = LogNegativeBounds(
-                floors=settings.process.locked_floors,
-                ceils=settings.process.locked_ceils,
-            )
-        elif settings.process.is_local_initialized:
-            bounds = LogNegativeBounds(
-                floors=settings.process.local_floors,
-                ceils=settings.process.local_ceils,
-            )
-        else:
+        needs_refs = (
+            shadow_refs_override is None
+            and not tiling_mode
+            and settings.exposure.cast_removal
+            and settings.process.process_mode == ProcessMode.C41
+        )
+        needs_bounds_analysis = not (
+            bounds_override
+            or (settings.process.use_roll_average and settings.process.is_locked_initialized)
+            or settings.process.is_local_initialized
+        )
+        # Measure the anchor for the render when Auto Density is on, and for the
+        # Analysis-panel stats on every preview (readback) regardless of toggle —
+        # it's only *used* in the render when auto_exposure (see uniforms).
+        needs_anchor = metered_anchor_override is None and not tiling_mode and (settings.exposure.auto_exposure or readback_metrics)
+        needs_textural = textural_range_override is None and not tiling_mode and settings.exposure.auto_normalize_contrast
+
+        analysis_source = None
+        analysis_roi = None
+        if needs_bounds_analysis or needs_refs or needs_anchor or needs_textural:
             # Use views to avoid copying the full-res image; crop to ROI first.
             analysis_source = img
             if settings.geometry.rotation != 0:
@@ -371,6 +385,19 @@ class GPUEngine:
 
             analysis_source = _downsample_for_analysis(analysis_source, APP_CONFIG.preview_render_size)
 
+        if bounds_override:
+            bounds = bounds_override
+        elif settings.process.use_roll_average and settings.process.is_locked_initialized:
+            bounds = LogNegativeBounds(
+                floors=settings.process.locked_floors,
+                ceils=settings.process.locked_ceils,
+            )
+        elif settings.process.is_local_initialized:
+            bounds = LogNegativeBounds(
+                floors=settings.process.local_floors,
+                ceils=settings.process.local_ceils,
+            )
+        else:
             bounds = analyze_log_exposure_bounds(
                 analysis_source,
                 analysis_roi,
@@ -378,6 +405,31 @@ class GPUEngine:
                 process_mode=settings.process.process_mode,
                 e6_normalize=settings.process.e6_normalize,
                 percentile_clip=settings.process.drange_clip,
+            )
+
+        shadow_refs = shadow_refs_override
+        if needs_refs and analysis_source is not None:
+            shadow_refs = measure_shadow_log_refs(
+                analysis_source,
+                analysis_roi,
+                settings.process.analysis_buffer,
+            )
+
+        metered_anchor = metered_anchor_override
+        if needs_anchor and analysis_source is not None:
+            metered_anchor = measure_anchor(
+                analysis_source,
+                bounds,
+                analysis_roi,
+                settings.process.analysis_buffer,
+            )
+
+        textural_range = textural_range_override
+        if needs_textural and analysis_source is not None:
+            textural_range = measure_textural_range(
+                analysis_source,
+                analysis_roi,
+                settings.process.analysis_buffer,
             )
 
         pw, ph, cw, ch, ox, oy = self._calculate_layout_dims(settings, crop_w, crop_h, render_size_ref)
@@ -394,6 +446,9 @@ class GPUEngine:
             render_size_ref,
             scale_factor,
             vignette_full_crop=vignette_full_crop,
+            shadow_refs=shadow_refs,
+            metered_anchor=metered_anchor,
+            textural_range=textural_range,
         )
         self._update_retouch_storage(
             settings.retouch,
@@ -652,6 +707,9 @@ class GPUEngine:
             "normalized_log": tex_norm,
             "content_rect": content_rect,
             "log_bounds": bounds,
+            "norm_density_range": luminance_density_range(bounds),
+            "metered_anchor": metered_anchor,
+            "textural_range": textural_range,
         }
 
         if not tiling_mode and readback_metrics:
@@ -687,6 +745,9 @@ class GPUEngine:
         render_size_ref: Optional[float],
         scale_factor: float,
         vignette_full_crop: Optional[Tuple[int, int, int, int]] = None,
+        shadow_refs: Optional[Tuple[float, float, float]] = None,
+        metered_anchor: Optional[float] = None,
+        textural_range: Optional[float] = None,
     ) -> None:
         """Packs and uploads all pipeline parameters to the unified UBO."""
         g_data = (
@@ -709,6 +770,9 @@ class GPUEngine:
         elif settings.process.process_mode == ProcessMode.E6:
             mode_val = 2
 
+        # E6 mirrors the CPU path (NormalizationProcessor), which negates the offsets.
+        offset_sign = -1.0 if mode_val == 2 else 1.0
+
         n_data = (
             struct.pack("ffff", f[0], f[1], f[2], 0.0)
             + struct.pack("ffff", c[0], c[1], c[2], 0.0)
@@ -716,8 +780,8 @@ class GPUEngine:
                 "IIffffffff",
                 mode_val,
                 (1 if settings.process.e6_normalize else 0),
-                settings.process.white_point_offset,
-                settings.process.black_point_offset,
+                offset_sign * settings.process.white_point_offset,
+                offset_sign * settings.process.black_point_offset,
                 0.0,
                 0.0,
                 0.0,
@@ -728,19 +792,44 @@ class GPUEngine:
             + b"\x00" * 32
         )
 
+        from negpy.features.exposure.logic import (
+            normalize_refs,
+            per_channel_curve_params,
+        )
         from negpy.features.exposure.models import EXPOSURE_CONSTANTS
+        from negpy.features.exposure.normalization import luminance_density_range
 
         exp = settings.exposure
-        shift = 0.01 + (exp.density * EXPOSURE_CONSTANTS["density_multiplier"])
-        slope, pivot = (
-            1.0 + (exp.grade * EXPOSURE_CONSTANTS["grade_multiplier"]),
-            1.0 - shift,
+        d_min = EXPOSURE_CONSTANTS["d_min"] if exp.paper_dmin else 0.0
+        # metered_anchor may be measured for stats even when auto_exposure is off;
+        # only let it move the render when the toggle is on.
+        render_anchor = metered_anchor if exp.auto_exposure else None
+        lum_range = luminance_density_range(bounds)
+        # Final bounds the shader normalizes with (after WP/BP offsets); shared by
+        # the Cast Removal shadow refs, mirroring the CPU path.
+        wp = offset_sign * settings.process.white_point_offset
+        bp = offset_sign * settings.process.black_point_offset
+        adj_floors = (f[0] + wp, f[1] + wp, f[2] + wp)
+        adj_ceils = (c[0] + bp, c[1] + bp, c[2] + bp)
+        shadow_refs_norm = None
+        if shadow_refs is not None:
+            shadow_refs_norm = normalize_refs(shadow_refs, adj_floors, adj_ceils)
+        slopes, pivots = per_channel_curve_params(
+            exp.grade,
+            exp.density,
+            exp.auto_normalize_contrast,
+            exp.cast_removal,
+            lum_range,
+            shadow_refs_norm,
+            textural_range,
+            d_min=d_min,
+            anchor=render_anchor,
         )
         cmy_m = EXPOSURE_CONSTANTS["cmy_max_density"]
 
         e_data = (
-            struct.pack("ffff", pivot, pivot, pivot, 0.0)
-            + struct.pack("ffff", slope, slope, slope, 0.0)
+            struct.pack("ffff", pivots[0], pivots[1], pivots[2], 0.0)
+            + struct.pack("ffff", slopes[0], slopes[1], slopes[2], 0.0)
             + struct.pack(
                 "ffff",
                 exp.wb_cyan * cmy_m,
@@ -764,15 +853,25 @@ class GPUEngine:
             )
             + struct.pack(
                 "ffffff",
-                exp.toe,
+                exp.toe * EXPOSURE_CONSTANTS["toe_shoulder_strength"],
                 exp.toe_width,
-                exp.shoulder,
+                exp.shoulder * EXPOSURE_CONSTANTS["toe_shoulder_strength"],
                 exp.shoulder_width,
-                4.0,  # d_max
-                2.2,  # gamma
+                EXPOSURE_CONSTANTS["d_max"],
+                d_min,
             )
-            + struct.pack("Ifff", mode_val, 0.0, 0.0, 0.0)
-            + b"\x00" * 16
+            + struct.pack(
+                "Iffff",
+                mode_val,
+                EXPOSURE_CONSTANTS["toe_onset_density"],
+                EXPOSURE_CONSTANTS["curve_asymptote"],
+                EXPOSURE_CONSTANTS["dmax_shoulder"],
+                EXPOSURE_CONSTANTS["paper_toe_nu"],
+            )
+            # flare (veiling-glare floor) + surround gamma + 1 pad float; mirrors the CPU kernel.
+            + struct.pack("f", float(EXPOSURE_CONSTANTS["flare_fraction"]) if exp.flare else 0.0)
+            + struct.pack("f", float(EXPOSURE_CONSTANTS["target_system_gamma"]) if exp.surround else 1.0)
+            + b"\x00" * 4
         )
 
         cls = float(settings.lab.clahe_strength)
@@ -837,15 +936,7 @@ class GPUEngine:
             + b"\x00" * 20
         )
 
-        from negpy.features.toning.logic import PAPER_PROFILES, PaperProfileName
-
-        prof = settings.toning.paper_profile
-        p_obj = PAPER_PROFILES.get(prof, PAPER_PROFILES[PaperProfileName.NONE])
-        tint, dmax, is_bw = (
-            p_obj.tint,
-            p_obj.dmax_boost,
-            (1 if settings.process.process_mode == ProcessMode.BW else 0),
-        )
+        is_bw = 1 if settings.process.process_mode == ProcessMode.BW else 0
         t_data = (
             struct.pack(
                 "ffff",
@@ -854,7 +945,6 @@ class GPUEngine:
                 float(settings.toning.sepia_strength),
                 2.2,
             )
-            + struct.pack("ffff", tint[0], tint[1], tint[2], dmax)
             + struct.pack("iiIf", crop_offset[0], crop_offset[1], is_bw, 0.0)
             + struct.pack(
                 "ffff",
@@ -1277,6 +1367,43 @@ class GPUEngine:
                 percentile_clip=settings.process.drange_clip,
             )
 
+        global_shadow_refs = None
+        if settings.exposure.cast_removal and settings.process.process_mode == ProcessMode.C41:
+            # Tiles must share one global measurement, like global_bounds.
+            ah, aw = img_rot.shape[:2]
+            a_scale = min(1.0, APP_CONFIG.preview_render_size / max(ah, aw))
+            analysis_roi = (int(y1 * a_scale), int(y2 * a_scale), int(x1 * a_scale), int(x2 * a_scale))
+            global_shadow_refs = measure_shadow_log_refs(
+                _downsample_for_analysis(img_rot, APP_CONFIG.preview_render_size),
+                roi=analysis_roi,
+                analysis_buffer=settings.process.analysis_buffer,
+            )
+
+        global_metered_anchor = None
+        if settings.exposure.auto_exposure:
+            # Tiles must share one global anchor, like global_bounds/shadow_refs.
+            ah, aw = img_rot.shape[:2]
+            a_scale = min(1.0, APP_CONFIG.preview_render_size / max(ah, aw))
+            analysis_roi = (int(y1 * a_scale), int(y2 * a_scale), int(x1 * a_scale), int(x2 * a_scale))
+            global_metered_anchor = measure_anchor(
+                _downsample_for_analysis(img_rot, APP_CONFIG.preview_render_size),
+                global_bounds,
+                roi=analysis_roi,
+                analysis_buffer=settings.process.analysis_buffer,
+            )
+
+        global_textural_range = None
+        if settings.exposure.auto_normalize_contrast:
+            # Tiles must share one global textural range, like global_bounds.
+            ah, aw = img_rot.shape[:2]
+            a_scale = min(1.0, APP_CONFIG.preview_render_size / max(ah, aw))
+            analysis_roi = (int(y1 * a_scale), int(y2 * a_scale), int(x1 * a_scale), int(x2 * a_scale))
+            global_textural_range = measure_textural_range(
+                _downsample_for_analysis(img_rot, APP_CONFIG.preview_render_size),
+                roi=analysis_roi,
+                analysis_buffer=settings.process.analysis_buffer,
+            )
+
         paper_w, paper_h, content_w, content_h, off_x, off_y = self._calculate_layout_dims(settings, crop_w, crop_h, None)
         full_source_res = np.zeros((crop_h, crop_w, 3), dtype=np.float32)
 
@@ -1296,6 +1423,9 @@ class GPUEngine:
                     scale_factor=scale_factor,
                     tiling_mode=True,
                     bounds_override=global_bounds,
+                    shadow_refs_override=global_shadow_refs,
+                    metered_anchor_override=global_metered_anchor,
+                    textural_range_override=global_textural_range,
                     global_offset=(ix1, iy1),
                     full_dims=(w_rot, h_rot),
                     clahe_cdf_override=global_cdfs,

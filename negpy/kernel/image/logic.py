@@ -108,6 +108,63 @@ def srgb_to_linear(img: np.ndarray) -> np.ndarray:
     return np.where(img <= 0.04045, img / 12.92, ((img + 0.055) / 1.055) ** 2.4).astype(np.float32)
 
 
+# CIELAB in the working space (Adobe RGB 1998, D65): sRGB transfer (matches the encoding) +
+# Adobe RGB primaries. Mirrors the WGSL rgb_to_lab; OpenCV's float Lab scale (L 0-100).
+_ADOBE_RGB_TO_XYZ = np.array(
+    [
+        [0.5767309, 0.1855540, 0.1881852],
+        [0.2973769, 0.6273491, 0.0752741],
+        [0.0270343, 0.0706872, 0.9911085],
+    ],
+    dtype=np.float32,
+)
+_XYZ_TO_ADOBE_RGB = np.array(
+    [
+        [2.0413690, -0.5649464, -0.3446944],
+        [-0.9692660, 1.8760108, 0.0415560],
+        [0.0134474, -0.1183897, 1.0154096],
+    ],
+    dtype=np.float32,
+)
+_D65_WHITE = np.array([0.95047, 1.00000, 1.08883], dtype=np.float32)
+_LAB_EPS = 0.008856
+_LAB_KAPPA = 7.787
+
+
+def rgb_to_lab_working(img: np.ndarray) -> np.ndarray:
+    """
+    sRGB-encoded Adobe-RGB-primaried image -> CIELAB (D65). Working-space-correct
+    replacement for cv2.cvtColor(..., COLOR_RGB2LAB), which assumes sRGB primaries.
+    """
+    rgb = np.clip(img.astype(np.float32), 0.0, None)
+    lin = np.where(rgb > 0.04045, ((rgb + 0.055) / 1.055) ** 2.4, rgb / 12.92).astype(np.float32)
+    xyz = lin @ _ADOBE_RGB_TO_XYZ.T
+    xyz = xyz / _D65_WHITE
+    f = np.where(xyz > _LAB_EPS, np.cbrt(xyz), _LAB_KAPPA * xyz + 16.0 / 116.0).astype(np.float32)
+    fx, fy, fz = f[..., 0], f[..., 1], f[..., 2]
+    lab = np.empty_like(f)
+    lab[..., 0] = 116.0 * fy - 16.0
+    lab[..., 1] = 500.0 * (fx - fy)
+    lab[..., 2] = 200.0 * (fy - fz)
+    return lab
+
+
+def lab_to_rgb_working(lab: np.ndarray) -> np.ndarray:
+    """Inverse of rgb_to_lab_working: CIELAB (D65) -> sRGB-encoded Adobe RGB."""
+    lab = lab.astype(np.float32)
+    fy = (lab[..., 0] + 16.0) / 116.0
+    fx = lab[..., 1] / 500.0 + fy
+    fz = fy - lab[..., 2] / 200.0
+    f = np.stack([fx, fy, fz], axis=-1)
+    f3 = f**3
+    xyz = np.where(f3 > _LAB_EPS, f3, (f - 16.0 / 116.0) / _LAB_KAPPA).astype(np.float32)
+    xyz = xyz * _D65_WHITE
+    lin = xyz @ _XYZ_TO_ADOBE_RGB.T
+    lin = np.clip(lin, 0.0, None)
+    rgb = np.where(lin > 0.0031308, 1.055 * lin ** (1.0 / 2.4) - 0.055, 12.92 * lin)
+    return rgb.astype(np.float32)
+
+
 @njit(cache=True, fastmath=True)
 def _float_to_uint8_luma_jit(img: np.ndarray) -> np.ndarray:
     """

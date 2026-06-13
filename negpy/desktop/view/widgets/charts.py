@@ -13,7 +13,6 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import QSizePolicy, QWidget
 
 from negpy.desktop.view.styles.theme import THEME
-
 from negpy.kernel.image.logic import get_luminance
 
 _CLIP_THRESH = 0.005  # fraction of pixels considered "clipping"
@@ -35,6 +34,12 @@ class HistogramWidget(QWidget):
         self._data_l: list = []
         self._clip_low: dict[str, bool] = {}
         self._clip_high: dict[str, bool] = {}
+        self._clip_low_frac: float = 0.0
+        self._clip_high_frac: float = 0.0
+
+    def clip_fractions(self) -> tuple[float, float]:
+        """Worst-channel shadow / highlight clipped fraction (0..1) of the last frame."""
+        return self._clip_low_frac, self._clip_high_frac
 
     def update_data(self, buffer: Any) -> None:
         """Calculates histograms and triggers repaint."""
@@ -45,6 +50,8 @@ class HistogramWidget(QWidget):
             self._data_l = []
             self._clip_low = {}
             self._clip_high = {}
+            self._clip_low_frac = 0.0
+            self._clip_high_frac = 0.0
             self.update()
             return
 
@@ -64,6 +71,8 @@ class HistogramWidget(QWidget):
                 "g": buffer[1][255] / totals[1] > _CLIP_THRESH,
                 "b": buffer[2][255] / totals[2] > _CLIP_THRESH,
             }
+            self._clip_low_frac = max(float(buffer[c][0]) / totals[c] for c in range(3))
+            self._clip_high_frac = max(float(buffer[c][255]) / totals[c] for c in range(3))
             self.update()
             return
 
@@ -90,6 +99,8 @@ class HistogramWidget(QWidget):
             "g": float(np.sum(buffer[..., 1] >= 0.998)) / n > _CLIP_THRESH,
             "b": float(np.sum(buffer[..., 2] >= 0.998)) / n > _CLIP_THRESH,
         }
+        self._clip_low_frac = max(float(np.sum(buffer[..., c] <= 0.002)) / n for c in range(3))
+        self._clip_high_frac = max(float(np.sum(buffer[..., c] >= 0.998)) / n for c in range(3))
         self.update()
 
     def _normalize(self, counts: np.ndarray) -> list:
@@ -225,6 +236,8 @@ class PhotometricCurveWidget(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMinimumHeight(40)
         self._curve_pts: list[tuple[float, float]] = []
+        # Per-channel (color, points) traces; empty unless Cast Removal diverges the channels.
+        self._channel_curves: list[tuple[QColor, list[tuple[float, float]]]] = []
         self._pivot_pt: tuple[float, float] | None = None
         self._toe_mask: list[float] = []
         self._shoulder_mask: list[float] = []
@@ -241,41 +254,71 @@ class PhotometricCurveWidget(QWidget):
 
     # ── data update ──────────────────────────────────────────────────────────
 
-    def update_curve(self, params) -> None:
-        from negpy.features.exposure.logic import LogisticSigmoid
+    def update_curve(
+        self,
+        params,
+        slope: float | None = None,
+        pivot: float | None = None,
+        slopes: tuple[float, float, float] | None = None,
+        pivots: tuple[float, float, float] | None = None,
+    ) -> None:
+        from negpy.features.exposure.logic import LogisticSigmoid, _expit, compute_pivot, grade_to_slope
         from negpy.features.exposure.models import EXPOSURE_CONSTANTS
         from negpy.kernel.image.validation import ensure_image
 
-        exposure_shift = 0.1 + (params.density * EXPOSURE_CONSTANTS["density_multiplier"])
-        pivot = 1.0 - exposure_shift
-        slope = 1.0 + (params.grade * EXPOSURE_CONSTANTS["grade_multiplier"])
+        d_min = EXPOSURE_CONSTANTS["d_min"] if params.paper_dmin else 0.0
 
-        curve = LogisticSigmoid(
-            contrast=slope,
-            pivot=pivot,
-            d_max=3.5,
-            toe=params.toe,
-            toe_width=params.toe_width,
-            shoulder=params.shoulder,
-            shoulder_width=params.shoulder_width,
-        )
+        # Slope/pivot come from the render path (session panel); fall back to
+        # the same helpers with no metrics when called without them.
+        if slope is None:
+            slope = grade_to_slope(params.grade, None)
+        if pivot is None:
+            pivot = compute_pivot(slope, params.density, d_min=d_min)
+
+        flare = EXPOSURE_CONSTANTS["flare_fraction"] if params.flare else 0.0
+        surround_gamma = EXPOSURE_CONSTANTS["target_system_gamma"] if params.surround else 1.0
 
         n = 300
         plt_x = np.linspace(self._X_MIN, self._X_MAX, n)
         x_log_exp = 1.0 - plt_x
 
-        d = curve(ensure_image(x_log_exp))
-        t = np.power(10.0, -d)
-        y = np.power(t, 1.0 / 2.2)
-        self._curve_pts = list(zip(plt_x.tolist(), y.tolist()))
+        def _curve_points(s: float, p: float) -> list[tuple[float, float]]:
+            # d_max/d_min from constants so the chart matches the render exactly.
+            curve = LogisticSigmoid(
+                contrast=s,
+                pivot=p,
+                d_min=d_min,
+                toe=params.toe,
+                toe_width=params.toe_width,
+                shoulder=params.shoulder,
+                shoulder_width=params.shoulder_width,
+                flare=flare,
+                surround_gamma=surround_gamma,
+            )
+            d = curve(ensure_image(x_log_exp))
+            t = np.power(10.0, -d)
+            # sRGB OETF — must match the exposure kernel's output encode.
+            yv = np.where(t <= 0.0031308, 12.92 * t, 1.055 * np.power(t, 1.0 / 2.4) - 0.055)
+            return list(zip(plt_x.tolist(), yv.tolist()))
+
+        # Base (white) reference curve — also the fill/pivot/zone geometry.
+        self._curve_pts = _curve_points(slope, pivot)
+
+        # Per-channel traces only when Cast Removal diverges the channels; else one white curve.
+        self._channel_curves = []
+        if slopes is not None and pivots is not None:
+            diverged = (max(slopes) - min(slopes) > 1e-9) or (max(pivots) - min(pivots) > 1e-9)
+            if diverged:
+                ch_colors = (QColor(255, 90, 90), QColor(90, 220, 120), QColor(95, 150, 255))
+                self._channel_curves = [(ch_colors[ch], _curve_points(slopes[ch], pivots[ch])) for ch in range(3)]
 
         # Toe/shoulder masks for zone shading (same formula as LogisticSigmoid)
         diff = x_log_exp - pivot
         epsilon = 1e-6
         t_val = params.toe_width * (diff / max(1.0 - pivot, epsilon) - 0.5)
-        self._toe_mask = (1.0 / (1.0 + np.exp(-t_val))).tolist()
+        self._toe_mask = _expit(t_val).tolist()
         s_val = -params.shoulder_width * (diff / max(pivot, epsilon) + 0.5)
-        self._shoulder_mask = (1.0 / (1.0 + np.exp(-s_val))).tolist()
+        self._shoulder_mask = _expit(s_val).tolist()
         self._toe_strength = params.toe
         self._shoulder_strength = params.shoulder
 
@@ -353,10 +396,19 @@ class PhotometricCurveWidget(QWidget):
             zx = int(self._wx(i * 0.1, w))
             painter.drawLine(zx, h - 5, zx, h - 1)
 
-        # Curve line (drawn after fills so it sits on top)
+        # Curve line on top; per-channel traces replace the white line when present.
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(QPen(QColor("#FFFFFF"), 1.5))
-        painter.drawPath(curve_path)
+        if self._channel_curves:
+            for color, pts in self._channel_curves:
+                ch_path = QPainterPath()
+                ch_path.moveTo(self._wx(pts[0][0], w), self._wy(pts[0][1], h))
+                for px, py in pts[1:]:
+                    ch_path.lineTo(self._wx(px, w), self._wy(py, h))
+                painter.setPen(QPen(color, 1.5))
+                painter.drawPath(ch_path)
+        else:
+            painter.setPen(QPen(QColor("#FFFFFF"), 1.5))
+            painter.drawPath(curve_path)
 
         # P3: Pivot crosshairs + dot
         if self._pivot_pt:

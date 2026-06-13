@@ -16,6 +16,7 @@ import qtawesome as qta
 from negpy.desktop.view.styles.theme import THEME
 from negpy.desktop.controller import AppController
 from negpy.desktop.view.widgets.charts import HistogramWidget, PhotometricCurveWidget
+from negpy.desktop.view.widgets.stats import NegativeStatsWidget
 from negpy.desktop.view.sidebar.header import SidebarHeader
 from negpy.desktop.view.sidebar.files import FileBrowser
 from negpy.desktop.view.sidebar.export import ExportSidebar
@@ -133,9 +134,11 @@ class SessionPanel(QWidget):
 
         self.hist_widget = HistogramWidget()
         self.curve_widget = PhotometricCurveWidget()
+        self.stats_widget = NegativeStatsWidget()
 
         analysis_layout.addWidget(self.hist_widget, 1)
         analysis_layout.addWidget(self.curve_widget, 1)
+        analysis_layout.addWidget(self.stats_widget, 0)
 
         self.stack.addWidget(wrap_scroll(self.analysis_group))
 
@@ -208,7 +211,50 @@ class SessionPanel(QWidget):
             if buffer is not None:
                 self.hist_widget.update_data(buffer)
 
-        self.curve_widget.update_curve(self.controller.session.state.config.exposure)
+        from negpy.features.exposure.logic import effective_grade_range, normalized_shadow_refs, per_channel_curve_params
+        from negpy.features.exposure.models import EXPOSURE_CONSTANTS
+
+        config = self.controller.session.state.config.exposure
+        # Mirror PhotometricProcessor so the plotted curve matches the render under
+        # the Auto Grade / Auto Density / Cast Removal toggles. CPU stores
+        # "final_bounds", GPU stores "log_bounds".
+        density_range = effective_grade_range(
+            config.auto_normalize_contrast,
+            metrics.get("norm_density_range"),
+            metrics.get("textural_range"),
+        )
+        d_min = EXPOSURE_CONSTANTS["d_min"] if config.paper_dmin else 0.0
+        anchor = metrics.get("metered_anchor") if config.auto_exposure else None
+        bounds = metrics.get("final_bounds") or metrics.get("log_bounds")
+        shadow_refs_norm = normalized_shadow_refs(bounds, metrics.get("shadow_log_refs"))
+        slopes, pivots = per_channel_curve_params(
+            config.grade,
+            config.density,
+            config.auto_normalize_contrast,
+            config.cast_removal,
+            metrics.get("norm_density_range"),
+            shadow_refs_norm,
+            metrics.get("textural_range"),
+            d_min=d_min,
+            anchor=anchor,
+        )
+        # Green channel is the base curve (white reference + stats slope).
+        slope, pivot = slopes[1], pivots[1]
+        self.curve_widget.update_curve(config, slope=slope, pivot=pivot, slopes=slopes, pivots=pivots)
+
+        from negpy.features.exposure.stats import negative_statistics
+
+        clip_low, clip_high = self.hist_widget.clip_fractions()
+        self.stats_widget.update_stats(
+            negative_statistics(
+                metrics.get("norm_density_range"),
+                metrics.get("metered_anchor"),
+                slope,
+                clip_low,
+                clip_high,
+                effective_range=density_range,
+            )
+        )
 
     def _on_update_found(self, version: str) -> None:
         self.update_label.setText(f"Update Available: v{version}")

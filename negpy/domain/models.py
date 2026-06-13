@@ -21,6 +21,10 @@ logger = get_logger("domain.models")
 MIGRATIONS: Dict[str, str] = {
     "export_border_size": "border_size",
     "export_border_color": "border_color",
+    # Shadow-neutral + density-balance consolidated into Cast Removal. Preserve a
+    # user's saved on/off; the unpublished "crossover"/"density_balance" keys are
+    # just dropped as unknown (default cast_removal=True).
+    "auto_shadow_neutral": "cast_removal",
 }
 
 
@@ -79,7 +83,7 @@ class ExportConfig:
 
     export_path: str = field(default_factory=lambda: os.path.join(paths.get_default_user_dir(), "export"))
     export_fmt: str = ExportFormat.JPEG
-    export_color_space: str = ColorSpace.SAME_AS_SOURCE.value
+    export_color_space: str = ColorSpace.ADOBE_RGB.value
     paper_aspect_ratio: str = AspectRatio.ORIGINAL
     export_print_size: float = 30.0
     export_dpi: int = 300

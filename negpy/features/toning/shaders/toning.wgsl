@@ -3,7 +3,6 @@ struct ToningUniforms {
     selenium_strength: f32,
     sepia_strength: f32,
     gamma: f32,
-    tint: vec4<f32>,           // rgb + dmax_boost
     crop_offset: vec2<i32>,    // x, y offset in input texture
     is_bw: u32,                // 1 if B&W mode
     pad2: f32,
@@ -26,9 +25,10 @@ fn rgb_to_lab(rgb: vec3<f32>) -> vec3<f32> {
     if (g > 0.04045) { g = pow((g + 0.055) / 1.055, 2.4); } else { g = g / 12.92; }
     if (b > 0.04045) { b = pow((b + 0.055) / 1.055, 2.4); } else { b = b / 12.92; }
 
-    var x = r * 0.4124 + g * 0.3576 + b * 0.1805;
-    var y = r * 0.2126 + g * 0.7152 + b * 0.0722;
-    var z = r * 0.0193 + g * 0.1192 + b * 0.9505;
+    // Adobe RGB (1998) -> XYZ, D65 (working-space primaries; matches CPU rgb_to_lab_working).
+    var x = r * 0.5767309 + g * 0.1855540 + b * 0.1881852;
+    var y = r * 0.2973769 + g * 0.6273491 + b * 0.0752741;
+    var z = r * 0.0270343 + g * 0.0706872 + b * 0.9911085;
 
     x = x / 0.95047;
     y = y / 1.00000;
@@ -58,9 +58,10 @@ fn lab_to_rgb(lab: vec3<f32>) -> vec3<f32> {
     y = y * 1.00000;
     z = z * 1.08883;
 
-    var r = x * 3.2406 + y * -1.5372 + z * -0.4986;
-    var g = x * -0.9689 + y * 1.8758 + z * 0.0415;
-    var b = x * 0.0557 + y * -0.2040 + z * 1.0570;
+    // XYZ -> Adobe RGB (1998), D65 (matches CPU lab_to_rgb_working).
+    var r = x * 2.0413690 + y * -0.5649464 + z * -0.3446944;
+    var g = x * -0.9692660 + y * 1.8760108 + z * 0.0415560;
+    var b = x * 0.0134474 + y * -0.1183897 + z * 1.0154096;
 
     if (r > 0.0031308) { r = 1.055 * pow(r, 1.0/2.4) - 0.055; } else { r = 12.92 * r; }
     if (g > 0.0031308) { g = 1.055 * pow(g, 1.0/2.4) - 0.055; } else { g = 12.92 * g; }
@@ -124,12 +125,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
 
         color = lab_to_rgb(lab);
-    }
-
-    // 4. Paper Tint / Dmax
-    color = color * params.tint.rgb;
-    if (params.tint.a != 1.0) {
-        color = pow(color, vec3<f32>(params.tint.a));
     }
 
     textureStore(output_tex, coords_out, vec4<f32>(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0));
