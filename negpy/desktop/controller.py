@@ -181,6 +181,8 @@ class AppController(QObject):
         self._render_debounce.setInterval(80)
         self._render_debounce.timeout.connect(self.request_render)
 
+        self._crop_bounds_dirty = False
+
         self._cursor_readout_timer = QTimer()
         self._cursor_readout_timer.setSingleShot(True)
         self._cursor_readout_timer.setInterval(33)
@@ -524,8 +526,19 @@ class AppController(QObject):
             self._handle_dust_pick(nx, ny)
 
     def set_active_tool(self, mode: ToolMode) -> None:
+        crop_tool_changed = ToolMode.CROP_MANUAL in (self.state.active_tool, mode)
+        leaving_crop = self.state.active_tool == ToolMode.CROP_MANUAL and mode != ToolMode.CROP_MANUAL
         self.state.active_tool = mode
         self.tool_sync_requested.emit()
+        if leaving_crop and self._crop_bounds_dirty:
+            # Recompute bounds once now the final crop is committed.
+            new_proc = replace(self.state.config.process, **invalidate_local_bounds(self.state.config.process))
+            self.session.update_config(replace(self.state.config, process=new_proc), render=False)
+            self._crop_bounds_dirty = False
+        if crop_tool_changed:
+            # Entering/leaving the crop tool swaps between the full uncropped preview
+            # and the normal cropped preview, so the canvas must re-render immediately.
+            self.request_render()
 
     def cancel_active_tool(self) -> None:
         if self.state.active_tool != ToolMode.NONE:
@@ -535,41 +548,32 @@ class AppController(QObject):
         """Request the canvas show the fine-rotation alignment grid."""
         self.rotation_guide_requested.emit()
 
-    def handle_crop_completed(self, nx1: float, ny1: float, nx2: float, ny2: float) -> None:
+    def handle_crop_rect_changed(self, nx1: float, ny1: float, nx2: float, ny2: float, persist: bool) -> None:
+        """Live-updates (persist=False) or commits (persist=True) the manual crop rect
+        while the crop tool is open. The tool stays active afterwards — darktable-style
+        continuous adjustment, not a one-shot drag-then-close."""
         if self.state.active_tool != ToolMode.CROP_MANUAL:
             return
-        with self.state.metrics_lock:
-            uv_grid = self.state.last_metrics.get("uv_grid")
-        if uv_grid is None:
-            return
-
-        rx1, ry1 = CoordinateMapping.map_click_to_raw(nx1, ny1, uv_grid)
-        rx2, ry2 = CoordinateMapping.map_click_to_raw(nx2, ny2, uv_grid)
-
         new_geo = replace(
             self.state.config.geometry,
             manual_crop_rect=(
-                min(rx1, rx2),
-                min(ry1, ry2),
-                max(rx1, rx2),
-                max(ry1, ry2),
+                min(nx1, nx2),
+                min(ny1, ny2),
+                max(nx1, nx2),
+                max(ny1, ny2),
             ),
             auto_crop_enabled=False,
         )
-        new_proc = replace(self.state.config.process, **invalidate_local_bounds(self.state.config.process))
-        self.session.update_config(replace(self.state.config, geometry=new_geo, process=new_proc))
-        self.state.active_tool = ToolMode.NONE
-        self.tool_sync_requested.emit()
-        self.request_render()
-
-    def handle_crop_translated(self, nx1: float, ny1: float, nx2: float, ny2: float) -> None:
-        if self.state.config.geometry.manual_crop_rect is None:
-            return
-        new_geo = replace(self.state.config.geometry, manual_crop_rect=(nx1, ny1, nx2, ny2))
-        self.session.update_config(replace(self.state.config, geometry=new_geo))
-        self.request_render()
+        # Defer the bounds recompute to crop-tool close; clearing here re-normalizes every drag step.
+        self._crop_bounds_dirty = True
+        self.session.update_config(replace(self.state.config, geometry=new_geo), persist=persist)
+        if persist:
+            self.request_render()
+        else:
+            self._render_debounce.start()
 
     def reset_crop(self) -> None:
+        self._crop_bounds_dirty = False
         new_proc = replace(self.state.config.process, **invalidate_local_bounds(self.state.config.process))
         self.session.update_config(
             replace(
@@ -581,6 +585,11 @@ class AppController(QObject):
         self.request_render()
 
     def apply_auto_crop(self) -> None:
+        # Autocrop supersedes a manual crop in progress: leave the tool.
+        if self.state.active_tool == ToolMode.CROP_MANUAL:
+            self.state.active_tool = ToolMode.NONE
+            self.tool_sync_requested.emit()
+        self._crop_bounds_dirty = False
         new_proc = replace(self.state.config.process, **invalidate_local_bounds(self.state.config.process))
         self.session.update_config(
             replace(
@@ -1115,6 +1124,7 @@ class AppController(QObject):
             readback_metrics=readback_metrics,
             ir_buffer=self.state.preview_ir,
             monitor_icc_bytes=self.state.monitor_icc_bytes,
+            crop_preview_full=self.state.active_tool == ToolMode.CROP_MANUAL,
         )
 
         if self._is_rendering:

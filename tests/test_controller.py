@@ -134,51 +134,106 @@ class TestAppController(unittest.TestCase):
         self.assertIsNone(saved_config.geometry.manual_crop_rect)
         self.controller.request_render.assert_called_once_with()
 
-    def test_manual_crop_completion_disables_auto_crop(self):
+    def test_manual_crop_rect_changed_disables_auto_crop(self):
         geometry = replace(self.controller.state.config.geometry, auto_crop_enabled=True)
         self.controller.state.config = replace(self.controller.state.config, geometry=geometry)
         self.controller.state.active_tool = ToolMode.CROP_MANUAL
-        self.controller.state.last_metrics = {"uv_grid": (0.0, 1.0, 0.0, 1.0)}
         self.controller.request_render = MagicMock()
 
-        with patch("negpy.desktop.controller.CoordinateMapping.map_click_to_raw", side_effect=[(0.2, 0.3), (0.8, 0.9)]):
-            self.controller.handle_crop_completed(0.2, 0.3, 0.8, 0.9)
+        self.controller.handle_crop_rect_changed(0.2, 0.3, 0.8, 0.9, True)
 
         saved_config = self.mock_session_manager.update_config.call_args.args[0]
         self.assertFalse(saved_config.geometry.auto_crop_enabled)
         self.assertEqual(saved_config.geometry.manual_crop_rect, (0.2, 0.3, 0.8, 0.9))
         self.controller.request_render.assert_called_once_with()
 
-    def test_handle_crop_translated_updates_rect(self):
+    def test_handle_crop_rect_changed_updates_rect(self):
         geometry = replace(self.controller.state.config.geometry, manual_crop_rect=(0.2, 0.2, 0.6, 0.5))
         self.controller.state.config = replace(self.controller.state.config, geometry=geometry)
+        self.controller.state.active_tool = ToolMode.CROP_MANUAL
         self.controller.request_render = MagicMock()
 
-        self.controller.handle_crop_translated(0.3, 0.25, 0.7, 0.55)
+        self.controller.handle_crop_rect_changed(0.3, 0.25, 0.7, 0.55, True)
 
         saved_config = self.mock_session_manager.update_config.call_args.args[0]
         self.assertEqual(saved_config.geometry.manual_crop_rect, (0.3, 0.25, 0.7, 0.55))
         self.controller.request_render.assert_called_once_with()
 
-    def test_handle_crop_translated_noop_when_no_manual_rect(self):
+    def test_handle_crop_rect_changed_noop_when_tool_inactive(self):
         geometry = replace(self.controller.state.config.geometry, manual_crop_rect=None)
         self.controller.state.config = replace(self.controller.state.config, geometry=geometry)
+        self.controller.state.active_tool = ToolMode.NONE
         self.controller.request_render = MagicMock()
 
-        self.controller.handle_crop_translated(0.1, 0.1, 0.5, 0.5)
+        self.controller.handle_crop_rect_changed(0.1, 0.1, 0.5, 0.5, True)
 
         self.mock_session_manager.update_config.assert_not_called()
         self.controller.request_render.assert_not_called()
 
-    def test_handle_crop_translated_does_not_deactivate_tool(self):
+    def test_handle_crop_rect_changed_does_not_deactivate_tool(self):
         geometry = replace(self.controller.state.config.geometry, manual_crop_rect=(0.2, 0.2, 0.6, 0.5))
         self.controller.state.config = replace(self.controller.state.config, geometry=geometry)
-        self.controller.state.active_tool = ToolMode.CROP_MOVE
+        self.controller.state.active_tool = ToolMode.CROP_MANUAL
         self.controller.request_render = MagicMock()
 
-        self.controller.handle_crop_translated(0.3, 0.25, 0.7, 0.55)
+        self.controller.handle_crop_rect_changed(0.3, 0.25, 0.7, 0.55, True)
 
-        self.assertEqual(self.controller.state.active_tool, ToolMode.CROP_MOVE)
+        self.assertEqual(self.controller.state.active_tool, ToolMode.CROP_MANUAL)
+
+    def test_handle_crop_rect_changed_live_drag_does_not_persist(self):
+        geometry = replace(self.controller.state.config.geometry, manual_crop_rect=(0.2, 0.2, 0.6, 0.5))
+        self.controller.state.config = replace(self.controller.state.config, geometry=geometry)
+        self.controller.state.active_tool = ToolMode.CROP_MANUAL
+        self.controller.request_render = MagicMock()
+
+        self.controller.handle_crop_rect_changed(0.3, 0.25, 0.7, 0.55, False)
+
+        self.assertEqual(self.mock_session_manager.update_config.call_args.kwargs.get("persist"), False)
+        self.controller.request_render.assert_not_called()
+
+    def test_handle_crop_rect_changed_defers_bounds_invalidation(self):
+        """During drag the auto-exposure bounds are left untouched (only flagged dirty),
+        so the base cache survives and the frame doesn't re-normalize each step."""
+        process = replace(self.controller.state.config.process, local_floors=(0.1, 0.2, 0.3), lock_bounds=False)
+        self.controller.state.config = replace(self.controller.state.config, process=process)
+        self.controller.state.active_tool = ToolMode.CROP_MANUAL
+        self.controller.request_render = MagicMock()
+
+        self.controller.handle_crop_rect_changed(0.2, 0.3, 0.8, 0.9, True)
+
+        saved_config = self.mock_session_manager.update_config.call_args.args[0]
+        self.assertEqual(saved_config.process.local_floors, (0.1, 0.2, 0.3))
+        self.assertTrue(self.controller._crop_bounds_dirty)
+
+    def test_leaving_crop_tool_invalidates_bounds_once(self):
+        """Closing the crop tool with a pending change recomputes bounds a single time."""
+        process = replace(
+            self.controller.state.config.process,
+            local_floors=(0.1, 0.2, 0.3),
+            local_ceils=(0.4, 0.5, 0.6),
+            lock_bounds=False,
+        )
+        self.controller.state.config = replace(self.controller.state.config, process=process)
+        self.controller.state.active_tool = ToolMode.CROP_MANUAL
+        self.controller._crop_bounds_dirty = True
+        self.controller.request_render = MagicMock()
+
+        self.controller.set_active_tool(ToolMode.NONE)
+
+        saved_config = self.mock_session_manager.update_config.call_args.args[0]
+        self.assertEqual(saved_config.process.local_floors, (0.0, 0.0, 0.0))
+        self.assertEqual(saved_config.process.local_ceils, (0.0, 0.0, 0.0))
+        self.assertFalse(self.controller._crop_bounds_dirty)
+        self.controller.request_render.assert_called_once()
+
+    def test_apply_auto_crop_exits_manual_crop_tool(self):
+        """Enabling autocrop while the manual crop tool is active deactivates the tool."""
+        self.controller.state.active_tool = ToolMode.CROP_MANUAL
+        self.controller.request_render = MagicMock()
+
+        self.controller.apply_auto_crop()
+
+        self.assertEqual(self.controller.state.active_tool, ToolMode.NONE)
 
     def test_local_overlay_visible_default_on(self):
         self.assertTrue(AppState().show_local_overlay)
