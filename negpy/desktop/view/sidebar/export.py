@@ -44,6 +44,7 @@ class ExportSidebar(BaseSidebar):
 
         self._add_preview_section()
         self._add_batch_section()
+        self._sync_flat_enabled()
 
         self.layout.addStretch()
 
@@ -153,10 +154,13 @@ class ExportSidebar(BaseSidebar):
 
         repo = self.controller.session.repo
         expanded = bool(repo.get_global_setting("section_expanded_contact_sheet", default=False))
-        section = CollapsibleSection("Contact Sheet", expanded=expanded, icon=qta.icon("fa5s.th", color="#aaa"))
-        section.set_content(content)
-        section.expanded_changed.connect(lambda checked: repo.save_global_setting("section_expanded_contact_sheet", checked))
-        self.layout.addWidget(section)
+        self.contact_sheet_section = CollapsibleSection("Contact Sheet", expanded=expanded, icon=qta.icon("fa5s.th", color="#aaa"))
+        self.contact_sheet_section.setToolTip(
+            "Render a contact sheet of display previews. Independent of flat master export."
+        )
+        self.contact_sheet_section.set_content(content)
+        self.contact_sheet_section.expanded_changed.connect(lambda checked: repo.save_global_setting("section_expanded_contact_sheet", checked))
+        self.layout.addWidget(self.contact_sheet_section)
 
     # --- Flat master ("for editing elsewhere") -------------------------------
 
@@ -192,7 +196,7 @@ class ExportSidebar(BaseSidebar):
         self.flat_format_row_widget = QWidget()
         fmt_row = QHBoxLayout(self.flat_format_row_widget)
         fmt_row.setContentsMargins(0, 0, 0, 0)
-        fmt_label = QLabel("Master")
+        fmt_label = QLabel("Format")
         fmt_label.setFixedWidth(52)
         fmt_row.addWidget(fmt_label)
         self.flat_format_combo = QComboBox()
@@ -236,14 +240,18 @@ class ExportSidebar(BaseSidebar):
         self.flat_roll_warning.setStyleSheet(f"color: {THEME.accent_edited}; font-size: 10px;")
         self.layout.addWidget(self.flat_roll_warning)
 
-        self._sync_flat_enabled()
-
     def _sync_flat_enabled(self) -> None:
         on = self.intent_flat_btn.isChecked()
+        if hasattr(self, "form"):
+            self.form.set_flat_mode(on)
         self.flat_format_row_widget.setVisible(on)
         self.flat_hint_label.setVisible(on)
         self.flat_peek_btn.setVisible(on)
         self._sync_flat_roll_warning()
+        if hasattr(self, "apply_all_btn"):
+            self.apply_all_btn.setToolTip(self._apply_all_tooltip_flat if on else self._apply_all_tooltip_print)
+        if hasattr(self, "form"):
+            self._refresh_export_enabled()
 
     def _sync_flat_roll_warning(self) -> None:
         """Show the roll-baseline nudge only when flat output is on and the roll
@@ -340,7 +348,9 @@ class ExportSidebar(BaseSidebar):
         self.apply_all_btn.setFixedHeight(40)
         self.apply_all_btn.setCheckable(True)
         self.apply_all_btn.setChecked(True)
-        self.apply_all_btn.setToolTip("Apply current export settings (Size, DPI, Border) to all files")
+        self._apply_all_tooltip_print = "Apply current export settings (format, size, color, destination) to all files"
+        self._apply_all_tooltip_flat = "Apply current export settings (size, color, destination) to all files"
+        self.apply_all_btn.setToolTip(self._apply_all_tooltip_print)
         self._update_apply_all_style(True)
         self.layout.addWidget(self.apply_all_btn)
 
