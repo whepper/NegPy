@@ -2,7 +2,7 @@
 
 ## 0.31.0
 
-- **Default tone curve retuned** — Auto Cast Removal is now on by default, Auto Grade targets slightly lower contrast, and the midtone contrast boost eases in more gradually, for a softer out-of-the-box look.
+- **Default tone curve retuned** — Auto Grade targets slightly lower contrast, and the midtone contrast boost eases in more gradually, for a softer out-of-the-box look.
 - **Cast Removal is now a slider** — the toggle becomes a 0–1 **strength** slider to dial colour-cast neutralization back partway (default 0.5). A small **auto** button (like Density/Grade) sets the strength from how confidently the frame's neutral references read — clean greys full, few-neutral scenes gentler — with the slider trimming on top.
 - **Lens distortion correction** — the Flat-Field profile gains a **k1** slider for radial (barrel/pincushion) correction, alongside illumination correction. Folded into the geometry transform (no RAW re-decode on drag), scale-to-fill, and kept in sync with crop/retouch/dodge-burn.
 - **Apply settings dialog** — the Sync Edits / Sync Crop buttons become one **Apply** button opening a dialog: pick Selected frames or the whole roll, tick any of Process, Crop, Rotation, Exposure, Color, Finish, Tonal span and Colour balance. The bounds options broadcast the source frame's normalization as a locked roll baseline (single-frame Batch Normalization).
