@@ -1,3 +1,4 @@
+import copy
 import os
 import uuid
 
@@ -145,7 +146,7 @@ class ExportPreset:
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     name: str = "Untitled Preset"
     enabled: bool = True
-    render_intent: str = RenderIntent.PRINT
+    render_intent: str = RenderIntent.PRINT  # fixed at creation; not exposed in the preset editor form
 
     # Format
     export_fmt: str = ExportFormat.JPEG
@@ -209,6 +210,13 @@ class ExportPreset:
     def from_dict(cls, d: Dict[str, Any]) -> "ExportPreset":
         known = cls.__dataclass_fields__.keys()
         return cls(**{k: v for k, v in d.items() if k in known})
+
+
+def preset_display_name(preset: ExportPreset) -> str:
+    """Preset list/checkbox label, flagging flat-master presets."""
+    if preset.render_intent == RenderIntent.FLAT:
+        return f"{preset.name} (flat)"
+    return preset.name
 
 
 def preset_from_export_config(conf: ExportConfig, name: str = "Current settings") -> ExportPreset:
@@ -392,43 +400,11 @@ def flat_master_config(config: WorkspaceConfig) -> WorkspaceConfig:
     return replace(config, exposure=flat_exposure)
 
 
-def flat_export_preset(preset: ExportPreset) -> ExportPreset:
-    """Apply flat-master delivery rules to a preset copy (TIFF/DNG, default full-res)."""
-    from copy import copy
-
-    fmt = preset.export_fmt if preset.export_fmt in (ExportFormat.TIFF, ExportFormat.DNG) else ExportFormat.TIFF
-    stub = ExportConfig(
-        export_fmt=fmt,
-        export_resolution_mode=preset.export_resolution_mode,
-        paper_aspect_ratio=preset.paper_aspect_ratio,
-        export_print_size=preset.export_print_size,
-        export_dpi=preset.export_dpi,
-        export_target_long_edge_px=preset.export_target_long_edge_px,
-    )
-    flat = flat_export_config(stub, fmt=fmt)
-    out = copy(preset)
-    out.export_fmt = flat.export_fmt
-    out.export_resolution_mode = flat.export_resolution_mode
-    out.paper_aspect_ratio = flat.paper_aspect_ratio
-    return out
-
-
-def resolve_preset_export(
-    preset: ExportPreset,
-    params: WorkspaceConfig,
-) -> tuple[WorkspaceConfig, ExportPreset]:
-    """Return (pipeline_config, delivery_preset) for one preset-driven export task."""
-    from copy import copy
-
-    delivery = copy(preset)
-    if preset.render_intent != RenderIntent.FLAT:
-        return params, delivery
-    return flat_master_config(params), flat_export_preset(preset)
-
-
-def flat_export_config(export: ExportConfig, fmt: str = ExportFormat.TIFF) -> ExportConfig:
+def flat_export_config(export: ExportConfig | ExportPreset, fmt: str = ExportFormat.TIFF) -> Any:
     """
-    Override export settings for a flat master.
+    Override export settings for a flat master. Works on ``ExportConfig`` or
+    ``ExportPreset`` — both share the same sizing/format field names — and
+    returns the same type it was given.
 
     Always sets ``export_fmt`` (TIFF 16-bit or DNG). Resolution defaults to
     full original size; if the user explicitly chose Print or Pixels sizing in
@@ -443,3 +419,19 @@ def flat_export_config(export: ExportConfig, fmt: str = ExportFormat.TIFF) -> Ex
         overrides["export_resolution_mode"] = ExportResolutionMode.ORIGINAL.value
         overrides["paper_aspect_ratio"] = AspectRatio.ORIGINAL
     return replace(export, **overrides)
+
+
+def flat_export_preset(preset: ExportPreset) -> ExportPreset:
+    """Apply flat-master delivery rules to a preset (TIFF/DNG, default full-res)."""
+    fmt = preset.export_fmt if preset.export_fmt in (ExportFormat.TIFF, ExportFormat.DNG) else ExportFormat.TIFF
+    return flat_export_config(preset, fmt=fmt)
+
+
+def resolve_preset_export(
+    preset: ExportPreset,
+    params: WorkspaceConfig,
+) -> tuple[WorkspaceConfig, ExportPreset]:
+    """Return (pipeline_config, delivery_preset) for one preset-driven export task."""
+    if preset.render_intent != RenderIntent.FLAT:
+        return params, copy.copy(preset)
+    return flat_master_config(params), flat_export_preset(preset)

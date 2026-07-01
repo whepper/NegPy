@@ -442,7 +442,7 @@ class ExportSettingsForm(QWidget):
         visible but limited to TIFF/DNG instead of hiding entirely.
         """
         enabled = bool(enabled)
-        if not preset_editor and enabled == self._flat_mode:
+        if enabled == self._flat_mode:
             return
         self._flat_mode = enabled
 

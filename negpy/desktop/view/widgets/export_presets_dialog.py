@@ -19,7 +19,7 @@ from PyQt6.QtWidgets import (
 
 from negpy.desktop.view.styles.theme import THEME
 from negpy.desktop.view.widgets.export_settings_form import ExportSettingsForm
-from negpy.domain.models import ColorSpace, ExportFormat, ExportPreset, ExportResolutionMode
+from negpy.domain.models import ColorSpace, ExportFormat, ExportPreset, ExportResolutionMode, preset_display_name
 from negpy.features.exposure.models import RenderIntent
 
 
@@ -169,10 +169,7 @@ class ExportPresetsDialog(QDialog):
         self.preset_list.blockSignals(True)
         self.preset_list.clear()
         for p in self._presets:
-            label = p.name
-            if p.render_intent == RenderIntent.FLAT:
-                label = f"{p.name} (flat)"
-            item = QListWidgetItem(label)
+            item = QListWidgetItem(preset_display_name(p))
             item.setCheckState(Qt.CheckState.Checked if p.enabled else Qt.CheckState.Unchecked)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             self.preset_list.addItem(item)
@@ -230,10 +227,7 @@ class ExportPresetsDialog(QDialog):
         self._presets[self._selected_idx].name = text
         item = self.preset_list.item(self._selected_idx)
         if item:
-            label = text
-            if self._presets[self._selected_idx].render_intent == RenderIntent.FLAT:
-                label = f"{text} (flat)"
-            item.setText(label)
+            item.setText(preset_display_name(self._presets[self._selected_idx]))
         self._emit_changed()
 
     def _on_enabled_changed(self, _state: int) -> None:
@@ -303,9 +297,6 @@ class ExportPresetsDialog(QDialog):
                 filename_pattern="{{ original_name }}_flat",
             )
         )
-
-    def _add_preset(self) -> None:
-        self._add_print_preset()
 
     def _duplicate_preset(self) -> None:
         if self._selected_idx < 0:
