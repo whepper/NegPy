@@ -31,6 +31,8 @@
 - Fix: **numpad keys bind separately** — the shortcut editor no longer collapses `Num+9` onto plain `9`, so numpad and number-row keys can hold different shortcuts. @jboneng
 - Fix: **no more 'surround' warning on load** — edits saved before the old surround control was removed no longer log an unknown-key warning every time you open a file. @linkmodo
 - Fix: **edits survive EXIF changes** — editing a file's EXIF metadata (e.g. tags) changes its content hash, which previously orphaned its saved edits; NegPy now falls back to matching by file path and re-homes the edits under the new hash. @RP2
+- Fix: **B&W renders match between CPU and GPU** — black-and-white previews and exports no longer come out darker or subtly tinted on the CPU path, and the Analysis histogram is smooth instead of combed.
+- Fix: **batch export honours the current destination** — exporting saved or selected frames now writes them to the destination you've set for the session (e.g. same-as-source) instead of the stale path each frame was last saved with. @RP2
 
 ## 0.36.0
 
