@@ -16,9 +16,12 @@ class ScanlightPreset:
     r_level: int = 255
     g_level: int = 255
     b_level: int = 255
+    w_level: int = 0  # RGB presets don't use white; a white-light preset stores 255
     shutter_r: str = ""
     shutter_g: str = ""
     shutter_b: str = ""
+    iso: str = ""  # camera ISO label baked at calibration (e.g. "100"); "" = not captured
+    aperture: str = ""  # aperture label (e.g. "f/8"); "" for a manual lens (no electronic aperture)
 
 
 class PresetStore:

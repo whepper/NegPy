@@ -221,9 +221,33 @@ def test_read_settings_omits_a_property_with_no_choices(cam):
 
 def test_read_settings_shape_matches_the_ui_contract(cam):
     iso = cam.read_settings()["iso"]
-    assert iso["cur"] == 1  # index of "100"
+    assert iso["cur"] == 1  # index of "100" in the body's full choice list
     assert iso["writable"] is True
-    assert iso["options"] == [{"label": "Auto", "raw": 0}, {"label": "100", "raw": 1}, {"label": "200", "raw": 2}]
+    # "Auto" is dropped (a scan wants a fixed ISO); survivors keep their original raw index.
+    assert iso["options"] == [{"label": "100", "raw": 1}, {"label": "200", "raw": 2}]
+
+
+def test_read_settings_drops_auto_and_mfnr_pseudo_isos(fake):
+    # Sony lists "Auto ISO" and low "Multi Frame Noise Reduction" pseudo-ISOs the scan can't use.
+    fake.props["iso"] = _Widget(fake, "iso", "100", ["Auto ISO", "80 Multi Frame Noise Reduction", "100", "125"])
+    camera = GphotoCamera(gp_module=fake)
+    camera.open()
+    options = camera.read_settings()["iso"]["options"]
+    assert [o["label"] for o in options] == ["100", "125"]  # only fixed numeric ISOs
+    assert [o["raw"] for o in options] == [2, 3]  # original positions in the full list
+    camera.close()
+
+
+def test_read_settings_switches_the_body_off_auto_iso(fake):
+    # On Auto/MFNR the stepper can't show the value (it was filtered), so instead of faking a fixed
+    # ISO the body is switched to its lowest real one, and that is reported — no discrepancy.
+    fake.props["iso"] = _Widget(fake, "iso", "Auto ISO", ["Auto ISO", "80 Multi Frame Noise Reduction", "100", "125"])
+    camera = GphotoCamera(gp_module=fake)
+    camera.open()
+    settings = camera.read_settings()["iso"]
+    assert ("iso", "100") in fake.writes  # switched off Auto to the lowest fixed ISO
+    assert settings["cur"] == 2  # 100's raw index in the full list → stepper and body agree
+    camera.close()
 
 
 # ---- capture ----------------------------------------------------------------
@@ -274,6 +298,24 @@ def test_capture_rejects_a_shutter_that_never_settles(cam, fake, tmp_path, monke
 def test_capture_skips_an_unchanged_shutter(cam, fake, tmp_path):
     cam.capture(str(tmp_path / "f.ARW"), shutter="1/5")  # already 1/5
     assert fake.writes == []
+
+
+def test_capture_forces_the_preset_iso_and_aperture(cam, fake, tmp_path):
+    fake.props["f-number"] = _Widget(fake, "f-number", "8", ["5.6", "8", "11"])  # an electronic lens
+    cam.capture(str(tmp_path / "f.ARW"), iso="200", aperture="11")
+    assert ("iso", "200") in fake.writes  # a drifted body is pulled back to the preset's exposure
+    assert ("f-number", "11") in fake.writes
+
+
+def test_capture_skips_iso_that_is_already_set(cam, fake, tmp_path):
+    cam.capture(str(tmp_path / "f.ARW"), iso="100")  # the body is already on ISO 100
+    assert fake.writes == []  # no needless ~1-2 s write before every scan
+
+
+def test_capture_tolerates_an_iso_the_body_rejects(cam, fake, tmp_path):
+    fake.reject_writes = True  # unlike the shutter, a rejected ISO warns and the scan proceeds
+    out = cam.capture(str(tmp_path / "f.ARW"), iso="200")
+    assert out.endswith(".ARW")  # captured anyway, not raised
 
 
 def test_capture_failure_raises_gphoto_error(cam, fake, tmp_path):
@@ -406,11 +448,20 @@ def test_magnifier_position_is_clamped_into_the_grid(cam, fake):
     assert int(x) <= 640 and int(y) <= 480
 
 
-def test_magnifier_off_is_verified_on_the_ratio_only(cam, fake, caplog):
-    # The body answers "Off,589,438" — comparing the whole string would never match.
-    cam.set_focus_magnifier(False)
+def test_magnifier_write_is_fire_and_forget(cam, fake, caplog):
+    # The body takes ~1-2 s to engage the magnifier, and polling the read-back for that whole time
+    # holds the single PTP claim and freezes the live preview (that freeze is the click-to-zoom
+    # lag). So the write is fire-and-forget: sent, then return without a read-back poll — even on a
+    # body that never echoes the value back, there is no settle timeout and no freeze.
+    fake._settle_writes = False  # the body would never confirm the write
+    cam.set_focus_magnifier_at(100, 100)
+    assert fake.writes[-1][0] == "focusmagnifier"  # the aim/zoom write was still sent
+    assert "did not settle" not in caplog.text  # but nothing waited on the read-back
+
+
+def test_magnifier_off_writes_the_packed_off_value(cam, fake):
+    cam.set_focus_magnifier(False)  # fresh session → default aim point (320, 240)
     assert ("focusmagnifier", "Off,320,240") in fake.writes
-    assert "did not settle" not in caplog.text
 
 
 def test_a_canon_style_magnifier_zooms_without_aiming(caplog):
